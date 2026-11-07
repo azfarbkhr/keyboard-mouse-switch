@@ -1,4 +1,5 @@
 """Run on the PC: python receiver.py"""
+import ctypes
 import datetime
 import hmac
 import ipaddress
@@ -14,6 +15,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 from pynput import keyboard, mouse
+from pynput.mouse._win32 import INPUT, INPUT_union, MOUSEINPUT, SendInput
 
 from common import PORT, fingerprint, messages, send
 
@@ -50,6 +52,14 @@ def local_ips():
         return []
 
 
+def move_mouse(dx, dy):
+    """Send actual mouse input so Windows can restore a pointer hidden by typing."""
+    event = INPUT(type=INPUT.MOUSE, value=INPUT_union(mi=MOUSEINPUT(
+        dx=dx, dy=dy, dwFlags=MOUSEINPUT.MOVE)))
+    if SendInput(1, ctypes.byref(event), ctypes.sizeof(INPUT)) != 1:
+        raise OSError("Windows rejected mouse movement")
+
+
 def serve_client(sock, secret):
     kb, ms = keyboard.Controller(), mouse.Controller()
     held_keys, held_buttons = set(), set()
@@ -83,7 +93,7 @@ def serve_client(sock, secret):
                 dx, dy = event.get("dx"), event.get("dy")
                 if type(dx) is not int or type(dy) is not int or abs(dx) > 10000 or abs(dy) > 10000:
                     raise ValueError("Invalid movement")
-                ms.move(dx, dy)
+                move_mouse(dx, dy)
             elif kind == "button":
                 name, down = event.get("button"), event.get("down")
                 if name not in buttons or type(down) is not bool:

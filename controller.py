@@ -15,6 +15,23 @@ SPACE = 0x20
 KEY_DOWN, KEY_UP = {0x100, 0x104}, {0x101, 0x105}
 
 
+class ScrollAccumulator:
+    """Preserve high-resolution wheel deltas and scale them without rounding up."""
+    def __init__(self):
+        self.remaining = {"x": 0, "y": 0}
+
+    def add(self, axis, delta, percent):
+        total = self.remaining[axis] + delta * percent
+        steps = abs(total) // 12000
+        if total < 0:
+            steps = -steps
+        self.remaining[axis] = total - steps * 12000
+        return steps
+
+    def reset(self):
+        self.remaining = {"x": 0, "y": 0}
+
+
 class App:
     def __init__(self, root):
         self.root = root
@@ -27,7 +44,8 @@ class App:
         self.remote_buttons = set()
         self.outgoing = queue.Queue(maxsize=8192)
         self.ui_events = queue.Queue()
-        self.hotkey_used = False
+        self.scroll_percent = 50
+        self.scroll_accumulator = ScrollAccumulator()
         self.status = tk.StringVar(value="Disconnected — laptop has control")
         self.host = tk.StringVar()
         self.port = tk.StringVar(value=str(PORT))
@@ -48,13 +66,23 @@ class App:
         ttk.Label(frame, text="Control:").grid(row=5, column=0, sticky="w")
         ttk.Button(frame, text="Laptop", command=self.to_local).grid(row=5, column=1, sticky="w")
         ttk.Button(frame, text="PC", command=self.to_remote).grid(row=5, column=2, sticky="w")
-        ttk.Label(frame, textvariable=self.status, wraplength=610).grid(row=6, column=0, columnspan=4, sticky="w", pady=(15, 4))
-        ttk.Label(frame, text="Return to laptop: Ctrl + Alt + Space", wraplength=610).grid(row=7, column=0, columnspan=4, sticky="w")
+        ttk.Label(frame, text="Scroll speed:").grid(row=6, column=0, sticky="w", pady=(10, 0))
+        self.scroll_choice = ttk.Combobox(frame, values=("25%", "50%", "75%", "100%"), width=8, state="readonly")
+        self.scroll_choice.set("50%")
+        self.scroll_choice.grid(row=6, column=1, sticky="w", pady=(10, 0))
+        self.scroll_choice.bind("<<ComboboxSelected>>", self.set_scroll_speed)
+        ttk.Label(frame, textvariable=self.status, wraplength=610).grid(row=7, column=0, columnspan=4, sticky="w", pady=(15, 4))
+        ttk.Label(frame, text="Return to laptop: Ctrl + Alt + Space", wraplength=610).grid(row=8, column=0, columnspan=4, sticky="w")
         self.klistener = keyboard.Listener(on_press=lambda key: None, win32_event_filter=self.key_filter)
         self.mlistener = mouse.Listener(on_move=lambda x, y: None, win32_event_filter=self.mouse_filter)
         self.klistener.start(); self.mlistener.start()
         root.protocol("WM_DELETE_WINDOW", self.close)
         root.after(100, self.pump_ui)
+
+    def set_scroll_speed(self, _event=None):
+        with self.lock:
+            self.scroll_percent = int(self.scroll_choice.get().rstrip("%"))
+            self.scroll_accumulator.reset()
 
     def post_status(self, value):
         self.ui_events.put(("status", value))
@@ -143,6 +171,7 @@ class App:
             self.swallow_keyups.update(self.pressed)
             self.swallow_buttons.update(self.remote_buttons)
             self.remote_buttons.clear()
+            self.scroll_accumulator.reset()
             self.remote = False
             self.enqueue({"type": "release"})
 
@@ -208,8 +237,10 @@ class App:
                 self.enqueue({"type": "button", "button": name, "down": down})
             elif msg in (0x20A, 0x20E):
                 delta = ctypes.c_short((data.mouseData >> 16) & 0xffff).value
-                steps = int(delta / 120) or (1 if delta > 0 else -1)
-                self.enqueue({"type": "scroll", "dx": steps if msg == 0x20E else 0, "dy": steps if msg == 0x20A else 0})
+                axis = "x" if msg == 0x20E else "y"
+                steps = self.scroll_accumulator.add(axis, delta, self.scroll_percent)
+                if steps:
+                    self.enqueue({"type": "scroll", "dx": steps if axis == "x" else 0, "dy": steps if axis == "y" else 0})
             self.mlistener.suppress_event()
         return True
 
