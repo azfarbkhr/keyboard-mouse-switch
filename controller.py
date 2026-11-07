@@ -8,6 +8,7 @@ from tkinter import messagebox, ttk
 
 from pynput import keyboard, mouse
 from common import PORT, connect, send
+from pairing import load_pairings, save_pairing
 
 CTRL = {0x11, 0xA2, 0xA3}
 ALT = {0x12, 0xA4, 0xA5}
@@ -51,6 +52,17 @@ class App:
         self.port = tk.StringVar(value=str(PORT))
         self.pin = tk.StringVar()
         self.secret = tk.StringVar()
+        self.saved_pairings = []
+        try:
+            self.saved_pairings = load_pairings()
+            if self.saved_pairings:
+                saved_pairing = self.saved_pairings[0]
+                self.host.set(saved_pairing["host"])
+                self.port.set(str(saved_pairing["port"]))
+                self.pin.set(saved_pairing["pin"])
+                self.secret.set(saved_pairing["secret"])
+        except (OSError, ValueError, KeyError) as exc:
+            self.status.set(f"Could not read saved pairing: {exc}. Enter details again.")
         root.title("Keyboard & Mouse Switch — Laptop")
         root.resizable(False, False)
         frame = ttk.Frame(root, padding=16)
@@ -73,11 +85,39 @@ class App:
         self.scroll_choice.bind("<<ComboboxSelected>>", self.set_scroll_speed)
         ttk.Label(frame, textvariable=self.status, wraplength=610).grid(row=7, column=0, columnspan=4, sticky="w", pady=(15, 4))
         ttk.Label(frame, text="Return to laptop: Ctrl + Alt + Space", wraplength=610).grid(row=8, column=0, columnspan=4, sticky="w")
+        ttk.Label(frame, text="Saved PCs:").grid(row=9, column=0, sticky="w", pady=(10, 0))
+        self.saved_choice = ttk.Combobox(frame, width=45, state="readonly")
+        self.saved_choice.grid(row=9, column=1, columnspan=3, sticky="w", pady=(10, 0))
+        self.saved_choice.bind("<<ComboboxSelected>>", self.select_saved_pairing)
+        self.refresh_saved_choices()
         self.klistener = keyboard.Listener(on_press=lambda key: None, win32_event_filter=self.key_filter)
         self.mlistener = mouse.Listener(on_move=lambda x, y: None, win32_event_filter=self.mouse_filter)
         self.klistener.start(); self.mlistener.start()
         root.protocol("WM_DELETE_WINDOW", self.close)
         root.after(100, self.pump_ui)
+        if self.saved_pairings:
+            root.after(200, self.connect_clicked)
+
+    def refresh_saved_choices(self):
+        labels = [f"{p['host']}:{p['port']} — {p['pin'][-12:]}" for p in self.saved_pairings]
+        self.saved_choice["values"] = labels
+        if labels:
+            self.saved_choice.current(0)
+        else:
+            self.saved_choice.set("")
+
+    def select_saved_pairing(self, _event=None):
+        index = self.saved_choice.current()
+        if index < 0 or index >= len(self.saved_pairings):
+            return
+        if self.sock:
+            self.disconnect()
+        pairing = self.saved_pairings[index]
+        self.host.set(pairing["host"])
+        self.port.set(str(pairing["port"]))
+        self.pin.set(pairing["pin"])
+        self.secret.set(pairing["secret"])
+        self.status.set("Saved PC selected — click Connect")
 
     def set_scroll_speed(self, _event=None):
         with self.lock:
@@ -93,6 +133,9 @@ class App:
                 kind, value = self.ui_events.get_nowait()
                 if kind == "status": self.status.set(value)
                 elif kind == "connect_enabled": self.connect_button.config(state="normal")
+                elif kind == "saved_pairings":
+                    self.saved_pairings = value
+                    self.refresh_saved_choices()
         except queue.Empty:
             pass
         self.root.after(100, self.pump_ui)
@@ -114,11 +157,18 @@ class App:
     def connect_worker(self, host, port, pin, secret):
         try:
             sock, stream = connect(host, port, pin, secret)
+            save_error = None
+            try:
+                saved_pairings = save_pairing(host, port, pin, secret)
+                self.ui_events.put(("saved_pairings", saved_pairings))
+            except (OSError, ValueError, KeyError) as exc:
+                save_error = str(exc)
             with self.lock:
                 self.sock = sock
                 self.outgoing = queue.Queue(maxsize=8192)
                 outgoing = self.outgoing
-            self.post_status("Connected — laptop has control")
+            self.post_status("Connected — laptop has control" if not save_error else
+                             f"Connected, but could not remember pairing: {save_error}")
             threading.Thread(target=self.sender, args=(sock, outgoing), daemon=True).start()
             threading.Thread(target=self.reader, args=(sock, stream), daemon=True).start()
         except Exception as exc:
