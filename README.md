@@ -4,7 +4,7 @@ A small Windows-to-Windows prototype that lets one laptop keyboard and mouse con
 
 ## Requirements
 
-- Windows 10 or 11 on both computers, with Python 3.10 or newer (include pip and Tkinter).
+- Windows 10 or 11 on both computers, with uv and Python 3.10 or newer (including Tkinter).
 - Both computers must be able to reach one another on the local network. Wi-Fi on the laptop and Ethernet on the PC is fine.
 - Copy this project folder to both computers. Do not copy `receiver-data`: the PC creates its own keys and pairing secret.
 
@@ -13,17 +13,15 @@ A small Windows-to-Windows prototype that lets one laptop keyboard and mouse con
 Open PowerShell in the project folder and run:
 
 ```powershell
-py -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
+uv sync
 ```
 
-If PowerShell blocks activation, skip activation and use `.\.venv\Scripts\python.exe` in place of `python` in each command instead.
+This creates a project-local `.venv` and installs the locked dependencies. You do not need to activate it; `uv run` uses it automatically. Install uv on each computer if needed: see [uv installation](https://docs.astral.sh/uv/getting-started/installation/).
 
 ## Start on the PC
 
 ```powershell
-python receiver.py
+uv run python receiver.py
 ```
 
 Keep the window open. It displays local IPv4 addresses, port, a certificate fingerprint, and a pairing secret. If several IPs are shown, choose the one belonging to the Ethernet adapter; run `ipconfig` if unsure. The first run generates `receiver-data` locally. Keep its contents private; it is excluded from Git.
@@ -33,7 +31,7 @@ If Windows Firewall asks, allow Python access to **private networks**. If the co
 ## Start on the laptop
 
 ```powershell
-python controller.py
+uv run python controller.py
 ```
 
 Enter the PC IP address, port, certificate fingerprint, and pairing secret shown on the PC. Check the fingerprint directly against the PC's display: it pins the receiver's certificate and protects the secret and input stream from an impersonator. Press **Connect**, then **PC**. Keyboard and mouse input now go to the PC. Press **Ctrl + Alt + Space** to return control to the laptop. Use the **Laptop** button when laptop control is active; the shortcut is needed while the PC has the mouse. Close either app or disconnect to return control to the laptop.
@@ -47,3 +45,4 @@ The shortcut releases forwarded keys and mouse buttons on the PC. If a connectio
 - This is a prototype. Windows secure screens, Ctrl+Alt+Delete, elevated application windows, some games and software that uses raw input may not accept forwarded input. Different keyboard layouts can affect characters. High-resolution scrolling may be coarse.
 - The first version relies on Windows input hooks and simulated input, and does not stream a screen, share a clipboard, or automatically start with Windows. It needs a live interactive Windows session on each machine.
 - Test the switch and shortcut with a second local mouse or keyboard available on the PC. The shortcut only works when the controller is running and Windows is accepting keyboard input.
+
