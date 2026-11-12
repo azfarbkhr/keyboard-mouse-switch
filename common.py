@@ -47,7 +47,7 @@ def connect(host, port, pin, secret):
         ctx.verify_mode = ssl.CERT_NONE  # Trust is established by the fingerprint below.
         sock = ctx.wrap_socket(raw, server_hostname=host)
         if fingerprint(sock.getpeercert(binary_form=True)) != pin:
-            raise ValueError("Certificate fingerprint does not match the PC")
+            raise ValueError("Certificate fingerprint does not match the receiver")
         send(sock, {"type": "auth", "secret": secret})
         stream = messages(sock)
         reply = next(stream)

@@ -1,5 +1,6 @@
-"""Run on the laptop: python controller.py"""
+"""Controller panel: captures local keyboard/mouse and forwards to a receiver."""
 import ctypes
+import ctypes.wintypes
 import queue
 import socket
 import threading
@@ -33,12 +34,15 @@ class ScrollAccumulator:
         self.remaining = {"x": 0, "y": 0}
 
 
-class App:
-    def __init__(self, root):
-        self.root = root
+class ControllerPanel(ttk.Frame):
+    """Tkinter panel and input-hook lifecycle for the controller role."""
+
+    def __init__(self, parent):
+        super().__init__(parent, padding=16)
         self.lock = threading.RLock()
         self.sock = None
         self.remote = False
+        self.stopped = False
         self.pressed = set()
         self.swallow_keyups = set()
         self.swallow_buttons = set()
@@ -47,12 +51,15 @@ class App:
         self.ui_events = queue.Queue()
         self.scroll_percent = 50
         self.scroll_accumulator = ScrollAccumulator()
-        self.status = tk.StringVar(value="Disconnected — laptop has control")
+        self.status = tk.StringVar(value="Disconnected — controller has control")
         self.host = tk.StringVar()
         self.port = tk.StringVar(value=str(PORT))
         self.pin = tk.StringVar()
         self.secret = tk.StringVar()
         self.saved_pairings = []
+        self._pump_id = None
+        self._autoconnect_id = None
+
         try:
             self.saved_pairings = load_pairings()
             if self.saved_pairings:
@@ -63,40 +70,52 @@ class App:
                 self.secret.set(saved_pairing["secret"])
         except (OSError, ValueError, KeyError) as exc:
             self.status.set(f"Could not read saved pairing: {exc}. Enter details again.")
-        root.title("Keyboard & Mouse Switch — Laptop")
-        root.resizable(False, False)
-        frame = ttk.Frame(root, padding=16)
-        frame.grid(sticky="nsew")
+
         for row, (label, var, show) in enumerate([
-            ("PC IP address", self.host, ""), ("Port", self.port, ""),
-            ("PC certificate fingerprint", self.pin, ""), ("Pairing secret", self.secret, "*")]):
-            ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", pady=4)
-            ttk.Entry(frame, textvariable=var, width=67, show=show).grid(row=row, column=1, columnspan=3, sticky="ew", padx=(10, 0))
-        self.connect_button = ttk.Button(frame, text="Connect", command=self.connect_clicked)
+            ("Receiver IP address", self.host, ""),
+            ("Port", self.port, ""),
+            ("Receiver certificate fingerprint", self.pin, ""),
+            ("Pairing secret", self.secret, "*"),
+        ]):
+            ttk.Label(self, text=label).grid(row=row, column=0, sticky="w", pady=4)
+            ttk.Entry(self, textvariable=var, width=67, show=show).grid(
+                row=row, column=1, columnspan=3, sticky="ew", padx=(10, 0)
+            )
+
+        self.connect_button = ttk.Button(self, text="Connect", command=self.connect_clicked)
         self.connect_button.grid(row=4, column=1, sticky="w", pady=10)
-        ttk.Button(frame, text="Disconnect", command=self.disconnect).grid(row=4, column=2, sticky="w", pady=10)
-        ttk.Label(frame, text="Control:").grid(row=5, column=0, sticky="w")
-        ttk.Button(frame, text="Laptop", command=self.to_local).grid(row=5, column=1, sticky="w")
-        ttk.Button(frame, text="PC", command=self.to_remote).grid(row=5, column=2, sticky="w")
-        ttk.Label(frame, text="Scroll speed:").grid(row=6, column=0, sticky="w", pady=(10, 0))
-        self.scroll_choice = ttk.Combobox(frame, values=("25%", "50%", "75%", "100%"), width=8, state="readonly")
+        ttk.Button(self, text="Disconnect", command=self.disconnect).grid(row=4, column=2, sticky="w", pady=10)
+
+        ttk.Label(self, text="Control:").grid(row=5, column=0, sticky="w")
+        ttk.Button(self, text="Controller", command=self.to_local).grid(row=5, column=1, sticky="w")
+        ttk.Button(self, text="Receiver", command=self.to_remote).grid(row=5, column=2, sticky="w")
+
+        ttk.Label(self, text="Scroll speed:").grid(row=6, column=0, sticky="w", pady=(10, 0))
+        self.scroll_choice = ttk.Combobox(self, values=("25%", "50%", "75%", "100%"), width=8, state="readonly")
         self.scroll_choice.set("50%")
         self.scroll_choice.grid(row=6, column=1, sticky="w", pady=(10, 0))
         self.scroll_choice.bind("<<ComboboxSelected>>", self.set_scroll_speed)
-        ttk.Label(frame, textvariable=self.status, wraplength=610).grid(row=7, column=0, columnspan=4, sticky="w", pady=(15, 4))
-        ttk.Label(frame, text="Return to laptop: Ctrl + Alt + Space", wraplength=610).grid(row=8, column=0, columnspan=4, sticky="w")
-        ttk.Label(frame, text="Saved PCs:").grid(row=9, column=0, sticky="w", pady=(10, 0))
-        self.saved_choice = ttk.Combobox(frame, width=45, state="readonly")
+
+        ttk.Label(self, textvariable=self.status, wraplength=610).grid(
+            row=7, column=0, columnspan=4, sticky="w", pady=(15, 4)
+        )
+        ttk.Label(self, text="Return to controller: Ctrl + Alt + Space", wraplength=610).grid(
+            row=8, column=0, columnspan=4, sticky="w"
+        )
+        ttk.Label(self, text="Saved receivers:").grid(row=9, column=0, sticky="w", pady=(10, 0))
+        self.saved_choice = ttk.Combobox(self, width=45, state="readonly")
         self.saved_choice.grid(row=9, column=1, columnspan=3, sticky="w", pady=(10, 0))
         self.saved_choice.bind("<<ComboboxSelected>>", self.select_saved_pairing)
         self.refresh_saved_choices()
+
         self.klistener = keyboard.Listener(on_press=lambda key: None, win32_event_filter=self.key_filter)
         self.mlistener = mouse.Listener(on_move=lambda x, y: None, win32_event_filter=self.mouse_filter)
-        self.klistener.start(); self.mlistener.start()
-        root.protocol("WM_DELETE_WINDOW", self.close)
-        root.after(100, self.pump_ui)
+        self.klistener.start()
+        self.mlistener.start()
+
+        self._pump_id = self.after(100, self.pump_ui)
         if self.saved_pairings:
-            root.after(200, self.connect_clicked)
+            self._autoconnect_id = self.after(200, self.connect_clicked)
 
     def refresh_saved_choices(self):
         labels = [f"{p['host']}:{p['port']} — {p['pin'][-12:]}" for p in self.saved_pairings]
@@ -117,7 +136,7 @@ class App:
         self.port.set(str(pairing["port"]))
         self.pin.set(pairing["pin"])
         self.secret.set(pairing["secret"])
-        self.status.set("Saved PC selected — click Connect")
+        self.status.set("Saved receiver selected — click Connect")
 
     def set_scroll_speed(self, _event=None):
         with self.lock:
@@ -128,27 +147,33 @@ class App:
         self.ui_events.put(("status", value))
 
     def pump_ui(self):
+        if self.stopped:
+            return
         try:
             while True:
                 kind, value = self.ui_events.get_nowait()
-                if kind == "status": self.status.set(value)
-                elif kind == "connect_enabled": self.connect_button.config(state="normal")
+                if kind == "status":
+                    self.status.set(value)
+                elif kind == "connect_enabled":
+                    self.connect_button.config(state="normal")
                 elif kind == "saved_pairings":
                     self.saved_pairings = value
                     self.refresh_saved_choices()
         except queue.Empty:
             pass
-        self.root.after(100, self.pump_ui)
+        self._pump_id = self.after(100, self.pump_ui)
 
     def connect_clicked(self):
-        if self.sock:
+        self._autoconnect_id = None
+        if self.stopped or self.sock:
             return
         try:
             port = int(self.port.get())
             if not self.host.get().strip() or not self.secret.get() or not 1 <= port <= 65535:
-                raise ValueError("Enter the PC address, port, fingerprint and secret.")
+                raise ValueError("Enter the receiver address, port, fingerprint and secret.")
         except ValueError as exc:
-            messagebox.showerror("Connection", str(exc)); return
+            messagebox.showerror("Connection", str(exc))
+            return
         self.connect_button.config(state="disabled")
         self.status.set("Connecting…")
         args = (self.host.get().strip(), port, self.pin.get(), self.secret.get())
@@ -157,6 +182,9 @@ class App:
     def connect_worker(self, host, port, pin, secret):
         try:
             sock, stream = connect(host, port, pin, secret)
+            if self.stopped:
+                sock.close()
+                return
             save_error = None
             try:
                 saved_pairings = save_pairing(host, port, pin, secret)
@@ -164,11 +192,17 @@ class App:
             except (OSError, ValueError, KeyError) as exc:
                 save_error = str(exc)
             with self.lock:
+                if self.stopped:
+                    sock.close()
+                    return
                 self.sock = sock
                 self.outgoing = queue.Queue(maxsize=8192)
                 outgoing = self.outgoing
-            self.post_status("Connected — laptop has control" if not save_error else
-                             f"Connected, but could not remember pairing: {save_error}")
+            self.post_status(
+                "Connected — controller has control"
+                if not save_error
+                else f"Connected, but could not remember pairing: {save_error}"
+            )
             threading.Thread(target=self.sender, args=(sock, outgoing), daemon=True).start()
             threading.Thread(target=self.reader, args=(sock, stream), daemon=True).start()
         except Exception as exc:
@@ -179,34 +213,43 @@ class App:
         try:
             while True:
                 msg = outgoing.get()
-                if msg is None: return
+                if msg is None:
+                    return
                 send(sock, msg)
         except (OSError, ValueError):
             self.connection_lost(sock)
 
     def reader(self, sock, stream):
         try:
-            for _ in stream: pass
+            for _ in stream:
+                pass
         except (OSError, ValueError):
             pass
         self.connection_lost(sock)
 
     def connection_lost(self, sock):
         with self.lock:
-            if self.sock is not sock: return
+            if self.sock is not sock:
+                return
             self._local_locked()
             self.sock = None
-            try: sock.shutdown(socket.SHUT_RDWR)
-            except OSError: pass
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
             sock.close()
-            try: self.outgoing.put_nowait(None)
-            except queue.Full: pass
-        self.post_status("Disconnected — laptop has control")
+            try:
+                self.outgoing.put_nowait(None)
+            except queue.Full:
+                pass
+        self.post_status("Disconnected — controller has control")
         self.ui_events.put(("connect_enabled", True))
 
     def disconnect(self):
-        with self.lock: sock = self.sock
-        if sock: self.connection_lost(sock)
+        with self.lock:
+            sock = self.sock
+        if sock:
+            self.connection_lost(sock)
 
     def enqueue(self, event):
         try:
@@ -214,7 +257,8 @@ class App:
         except queue.Full:
             # Never block a Windows hook; close the connection and fail safe.
             sock = self.sock
-            if sock: threading.Thread(target=self.connection_lost, args=(sock,), daemon=True).start()
+            if sock:
+                threading.Thread(target=self.connection_lost, args=(sock,), daemon=True).start()
 
     def _local_locked(self):
         if self.remote:
@@ -229,79 +273,112 @@ class App:
         with self.lock:
             self._local_locked()
             connected = self.sock is not None
-        self.post_status("Connected — laptop has control" if connected else "Disconnected — laptop has control")
+        self.post_status(
+            "Connected — controller has control" if connected else "Disconnected — controller has control"
+        )
 
     def to_remote(self):
         with self.lock:
             if not self.sock:
-                messagebox.showinfo("Not connected", "Connect to the PC first."); return
+                messagebox.showinfo("Not connected", "Connect to the receiver first.")
+                return
             if self.pressed:
-                self.post_status("Release all keyboard keys before switching to the PC."); return
+                self.post_status("Release all keyboard keys before switching to the receiver.")
+                return
             self.remote = True
-        self.post_status("Connected — PC has control. Press Ctrl + Alt + Space to return.")
+        self.post_status("Connected — receiver has control. Press Ctrl + Alt + Space to return.")
 
     def key_filter(self, msg, data):
-        if data.flags & 0x10: return True  # Ignore injected events.
+        if data.flags & 0x10:
+            return True  # Ignore injected events.
         vk = data.vkCode
         down = msg in KEY_DOWN
         up = msg in KEY_UP
-        if not (down or up): return True
+        if not (down or up):
+            return True
         with self.lock:
-            if down: self.pressed.add(vk)
-            else: self.pressed.discard(vk)
+            if down:
+                self.pressed.add(vk)
+            else:
+                self.pressed.discard(vk)
             if up and vk in self.swallow_keyups:
                 self.swallow_keyups.discard(vk)
                 self.klistener.suppress_event()
             if self.remote:
                 if down and vk == SPACE and self.pressed.intersection(CTRL) and self.pressed.intersection(ALT):
                     self._local_locked()
-                    self.post_status("Connected — laptop has control")
+                    self.post_status("Connected — controller has control")
                 else:
                     self.enqueue({"type": "key", "vk": vk, "down": down})
                 self.klistener.suppress_event()
         return True
 
     def mouse_filter(self, msg, data):
-        if data.flags & 1: return True  # Ignore injected events.
-        button_map = {0x201: ("left", True), 0x202: ("left", False),
-                      0x204: ("right", True), 0x205: ("right", False),
-                      0x207: ("middle", True), 0x208: ("middle", False),
-                      0x20B: ("x1" if (data.mouseData >> 16) == 1 else "x2", True),
-                      0x20C: ("x1" if (data.mouseData >> 16) == 1 else "x2", False)}
+        if data.flags & 1:
+            return True  # Ignore injected events.
+        button_map = {
+            0x201: ("left", True), 0x202: ("left", False),
+            0x204: ("right", True), 0x205: ("right", False),
+            0x207: ("middle", True), 0x208: ("middle", False),
+            0x20B: ("x1" if (data.mouseData >> 16) == 1 else "x2", True),
+            0x20C: ("x1" if (data.mouseData >> 16) == 1 else "x2", False),
+        }
         with self.lock:
             if msg in button_map:
                 name, down = button_map[msg]
                 if not down and name in self.swallow_buttons:
                     self.swallow_buttons.discard(name)
                     self.mlistener.suppress_event()
-            if not self.remote: return True
+            if not self.remote:
+                return True
             if msg == 0x200:
                 point = ctypes.wintypes.POINT()
                 ctypes.windll.user32.GetCursorPos(ctypes.byref(point))
                 dx, dy = data.pt.x - point.x, data.pt.y - point.y
-                if dx or dy: self.enqueue({"type": "move", "dx": dx, "dy": dy})
+                if dx or dy:
+                    self.enqueue({"type": "move", "dx": dx, "dy": dy})
             elif msg in button_map:
                 name, down = button_map[msg]
-                if down: self.remote_buttons.add(name)
-                else: self.remote_buttons.discard(name)
+                if down:
+                    self.remote_buttons.add(name)
+                else:
+                    self.remote_buttons.discard(name)
                 self.enqueue({"type": "button", "button": name, "down": down})
             elif msg in (0x20A, 0x20E):
                 delta = ctypes.c_short((data.mouseData >> 16) & 0xffff).value
                 axis = "x" if msg == 0x20E else "y"
                 steps = self.scroll_accumulator.add(axis, delta, self.scroll_percent)
                 if steps:
-                    self.enqueue({"type": "scroll", "dx": steps if axis == "x" else 0, "dy": steps if axis == "y" else 0})
+                    self.enqueue({
+                        "type": "scroll",
+                        "dx": steps if axis == "x" else 0,
+                        "dy": steps if axis == "y" else 0,
+                    })
             self.mlistener.suppress_event()
         return True
 
-    def close(self):
+    def stop(self):
+        self.stopped = True
+        if self._pump_id is not None:
+            self.after_cancel(self._pump_id)
+            self._pump_id = None
+        if self._autoconnect_id is not None:
+            self.after_cancel(self._autoconnect_id)
+            self._autoconnect_id = None
         self.disconnect()
-        self.klistener.stop(); self.mlistener.stop()
-        self.root.destroy()
+        self.klistener.stop()
+        self.mlistener.stop()
+
+
+def main():
+    root = tk.Tk()
+    root.title("Keyboard & Mouse Switch — Controller")
+    root.resizable(False, False)
+    panel = ControllerPanel(root)
+    panel.grid(sticky="nsew")
+    root.protocol("WM_DELETE_WINDOW", lambda: (panel.stop(), root.destroy()))
+    root.mainloop()
 
 
 if __name__ == "__main__":
-    import ctypes.wintypes
-    root = tk.Tk()
-    App(root)
-    root.mainloop()
+    main()
