@@ -8,13 +8,14 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 from pynput import keyboard, mouse
-from common import PORT, connect, send
+from common import PORT, connect, send_batch
 from pairing import load_pairings, save_pairing
 
 CTRL = {0x11, 0xA2, 0xA3}
 ALT = {0x12, 0xA4, 0xA5}
 SPACE = 0x20
 KEY_DOWN, KEY_UP = {0x100, 0x104}, {0x101, 0x105}
+MAX_SEND_BATCH = 64
 
 
 class ScrollAccumulator:
@@ -215,7 +216,17 @@ class ControllerPanel(ttk.Frame):
                 msg = outgoing.get()
                 if msg is None:
                     return
-                send(sock, msg)
+                # Drain events already queued during a burst, without delaying the first one.
+                batch = [msg]
+                for _ in range(MAX_SEND_BATCH - 1):
+                    try:
+                        msg = outgoing.get_nowait()
+                    except queue.Empty:
+                        break
+                    if msg is None:
+                        return
+                    batch.append(msg)
+                send_batch(sock, batch)
         except (OSError, ValueError):
             self.connection_lost(sock)
 
@@ -333,10 +344,11 @@ class ControllerPanel(ttk.Frame):
                 return True
             if msg == 0x200:
                 point = ctypes.wintypes.POINT()
-                ctypes.windll.user32.GetCursorPos(ctypes.byref(point))
-                dx, dy = data.pt.x - point.x, data.pt.y - point.y
-                if dx or dy:
-                    self.enqueue({"type": "move", "dx": dx, "dy": dy})
+                # Low-level hook coordinates are physical pixels, including on scaled displays.
+                if ctypes.windll.user32.GetPhysicalCursorPos(ctypes.byref(point)):
+                    dx, dy = data.pt.x - point.x, data.pt.y - point.y
+                    if dx or dy:
+                        self.enqueue({"type": "move", "dx": dx, "dy": dy})
             elif msg in button_map:
                 name, down = button_map[msg]
                 if down:

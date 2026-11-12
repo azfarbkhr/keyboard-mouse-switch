@@ -17,7 +17,12 @@ def normalize_fingerprint(value):
 
 
 def send(sock, data):
-    sock.sendall((json.dumps(data, separators=(",", ":")) + "\n").encode())
+    send_batch(sock, (data,))
+
+
+def send_batch(sock, events):
+    lines = "".join(json.dumps(event, separators=(",", ":")) + "\n" for event in events)
+    sock.sendall(lines.encode())
 
 
 def messages(sock):
@@ -42,6 +47,7 @@ def connect(host, port, pin, secret):
         raise ValueError("Certificate fingerprint must contain 64 hex characters")
     raw = socket.create_connection((host, port), timeout=5)
     try:
+        raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE  # Trust is established by the fingerprint below.

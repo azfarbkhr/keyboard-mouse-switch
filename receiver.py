@@ -9,7 +9,9 @@ import secrets
 import socket
 import ssl
 import threading
+import time
 import tkinter as tk
+from ctypes import wintypes
 from pathlib import Path
 from tkinter import ttk
 
@@ -23,6 +25,17 @@ from pynput.mouse._win32 import INPUT, INPUT_union, MOUSEINPUT, SendInput
 from common import PORT, fingerprint, messages, send
 
 DATA = Path(__file__).resolve().parent / "receiver-data"
+USER32 = ctypes.windll.user32
+DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE = ctypes.c_void_p(-3)
+MONITOR_CALLBACK = ctypes.WINFUNCTYPE(
+    wintypes.BOOL, wintypes.HMONITOR, wintypes.HDC, ctypes.POINTER(wintypes.RECT), wintypes.LPARAM
+)
+MOVE_ABSOLUTE_ON_VIRTUAL_DESKTOP = MOUSEINPUT.MOVE | 0x8000 | 0x4000
+POINTER_IDLE_SECONDS = 0.030
+
+# DPI awareness contexts and monitor handles are pointer-sized on Windows.
+USER32.SetThreadDpiAwarenessContext.argtypes = (ctypes.c_void_p,)
+USER32.SetThreadDpiAwarenessContext.restype = ctypes.c_void_p
 
 
 def setup():
@@ -70,15 +83,73 @@ def local_ips():
         return []
 
 
-def move_mouse(dx, dy):
-    """Send actual mouse input so Windows can restore a pointer hidden by typing."""
-    event = INPUT(type=INPUT.MOUSE, value=INPUT_union(mi=MOUSEINPUT(dx=dx, dy=dy, dwFlags=MOUSEINPUT.MOVE)))
-    if SendInput(1, ctypes.byref(event), ctypes.sizeof(INPUT)) != 1:
-        raise OSError("Windows rejected mouse movement")
+class Pointer:
+    """Apply the controller's pixel deltas using absolute Windows mouse input."""
+
+    def __init__(self):
+        self.last_move = None
+
+    def sync(self):
+        point = wintypes.POINT()
+        clip = wintypes.RECT()
+        monitors = []
+
+        @MONITOR_CALLBACK
+        def collect_monitor(_monitor, _dc, bounds, _data):
+            rect = bounds.contents
+            monitors.append((rect.left, rect.top, rect.right, rect.bottom))
+            return True
+
+        if (
+            not USER32.GetPhysicalCursorPos(ctypes.byref(point))
+            or not USER32.GetClipCursor(ctypes.byref(clip))
+            or not USER32.EnumDisplayMonitors(None, None, collect_monitor, 0)
+            or not monitors
+        ):
+            raise OSError("Could not read receiver cursor or display bounds")
+
+        self.x, self.y = point.x, point.y
+        self.left = min(left for left, _, _, _ in monitors)
+        self.top = min(top for _, top, _, _ in monitors)
+        self.width = max(right for _, _, right, _ in monitors) - self.left
+        self.height = max(bottom for _, _, _, bottom in monitors) - self.top
+        self.bounds = []
+        for left, top, right, bottom in monitors:
+            left, top = max(left, clip.left), max(top, clip.top)
+            right, bottom = min(right, clip.right), min(bottom, clip.bottom)
+            if left < right and top < bottom:
+                self.bounds.append((left, top, right, bottom))
+        if not self.bounds:
+            raise OSError("Receiver cursor is confined outside its display bounds")
+
+    def move(self, dx, dy):
+        now = time.monotonic()
+        if self.last_move is None or now - self.last_move >= POINTER_IDLE_SECONDS:
+            self.sync()
+
+        # SendInput queues events. Keep the last target through a burst so the
+        # next delta still applies if Windows has yet to move the cursor there.
+        x, y = self.x + dx, self.y + dy
+        targets = (
+            (min(max(x, left), right - 1), min(max(y, top), bottom - 1))
+            for left, top, right, bottom in self.bounds
+        )
+        self.x, self.y = min(targets, key=lambda target: (target[0] - x)**2 + (target[1] - y)**2)
+
+        # Choose the center of each pixel's bin in the normalized 16-bit range.
+        event = INPUT(type=INPUT.MOUSE, value=INPUT_union(mi=MOUSEINPUT(
+            dx=(2 * (self.x - self.left) + 1) * 32768 // self.width,
+            dy=(2 * (self.y - self.top) + 1) * 32768 // self.height,
+            dwFlags=MOVE_ABSOLUTE_ON_VIRTUAL_DESKTOP,
+        )))
+        if SendInput(1, ctypes.byref(event), ctypes.sizeof(INPUT)) != 1:
+            raise OSError("Windows rejected mouse movement")
+        self.last_move = now
 
 
 def serve_client(sock, secret, on_status=None):
     kb, ms = keyboard.Controller(), mouse.Controller()
+    pointer = Pointer()
     held_keys, held_buttons = set(), set()
     buttons = {
         "left": mouse.Button.left,
@@ -88,6 +159,7 @@ def serve_client(sock, secret, on_status=None):
         "x2": mouse.Button.x2,
     }
     authenticated = False
+    previous_dpi_context = None
     try:
         sock.settimeout(10)
         stream = messages(sock)
@@ -104,6 +176,9 @@ def serve_client(sock, secret, on_status=None):
         send(sock, {"type": "ok"})
         sock.settimeout(None)
         authenticated = True
+        previous_dpi_context = USER32.SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE)
+        if not previous_dpi_context:
+            raise OSError("Could not enable physical screen coordinates on the receiver")
         if on_status:
             on_status("Controller connected")
         for event in stream:
@@ -124,7 +199,7 @@ def serve_client(sock, secret, on_status=None):
                 dx, dy = event.get("dx"), event.get("dy")
                 if type(dx) is not int or type(dy) is not int or abs(dx) > 10000 or abs(dy) > 10000:
                     raise ValueError("Invalid movement")
-                move_mouse(dx, dy)
+                pointer.move(dx, dy)
             elif kind == "button":
                 name, down = event.get("button"), event.get("down")
                 if name not in buttons or type(down) is not bool:
@@ -141,6 +216,7 @@ def serve_client(sock, secret, on_status=None):
                     raise ValueError("Invalid scroll")
                 ms.scroll(dx, dy)
             elif kind == "release":
+                pointer.last_move = None
                 for vk in list(held_keys):
                     kb.release(keyboard.KeyCode.from_vk(vk))
                 for name in list(held_buttons):
@@ -153,6 +229,8 @@ def serve_client(sock, secret, on_status=None):
         if authenticated and on_status:
             on_status(f"Controller disconnected ({exc}); held inputs released — waiting for controller")
     finally:
+        if previous_dpi_context:
+            USER32.SetThreadDpiAwarenessContext(previous_dpi_context)
         for vk in held_keys:
             kb.release(keyboard.KeyCode.from_vk(vk))
         for name in held_buttons:
