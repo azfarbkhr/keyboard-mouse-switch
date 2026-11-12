@@ -20,9 +20,10 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 from pynput import keyboard, mouse
+from pynput._util.win32 import KEYBDINPUT
 from pynput.mouse._win32 import INPUT, INPUT_union, MOUSEINPUT, SendInput
 
-from common import PORT, fingerprint, messages, send
+from common import NUM_LOCK, PORT, SHIFT_KEYS, fingerprint, key_identity, messages, send
 
 DATA = Path(__file__).resolve().parent / "receiver-data"
 USER32 = ctypes.windll.user32
@@ -147,10 +148,24 @@ class Pointer:
         self.last_move = now
 
 
+def replay_key(vk, scan, extended):
+    if vk == NUM_LOCK:
+        return keyboard.Key.num_lock.value
+    physical_shift = vk in SHIFT_KEYS and scan in (0x2A, 0x36)
+    physical_keypad = not extended and 0x47 <= scan <= 0x53
+    if physical_shift or physical_keypad:
+        # Preserve Shift's side and let the receiver interpret the physical keypad.
+        return keyboard.KeyCode.from_vk(vk, _scan=scan, _flags=KEYBDINPUT.SCANCODE)
+    return keyboard.KeyCode.from_vk(
+        vk, _scan=scan if scan <= 0xFF else 0,
+        _flags=KEYBDINPUT.EXTENDEDKEY if extended else 0,
+    )
+
+
 def serve_client(sock, secret, on_status=None):
     kb, ms = keyboard.Controller(), mouse.Controller()
     pointer = Pointer()
-    held_keys, held_buttons = set(), set()
+    held_keys, held_buttons = {}, set()
     buttons = {
         "left": mouse.Button.left,
         "right": mouse.Button.right,
@@ -185,16 +200,27 @@ def serve_client(sock, secret, on_status=None):
             kind = event.get("type")
             if kind == "key":
                 vk = event.get("vk")
+                scan = event.get("scan", 0)
+                extended = event.get("extended", False)
                 down = event.get("down")
-                if type(vk) is not int or not 0 < vk < 256 or type(down) is not bool:
+                if (
+                    type(vk) is not int or not 0 < vk < 256
+                    or type(scan) is not int or not 0 <= scan <= 0xFFFF
+                    or type(extended) is not bool or type(down) is not bool
+                ):
                     raise ValueError("Invalid key")
-                key = keyboard.KeyCode.from_vk(vk)
+                identity = key_identity(vk, scan, extended)
+                key = held_keys.get(identity)
+                if down and key is not None and vk == NUM_LOCK:
+                    continue  # Toggle once per press, even when Windows repeats the key.
+                if key is None:
+                    key = replay_key(vk, scan, extended)
                 if down:
                     kb.press(key)
-                    held_keys.add(vk)
+                    held_keys[identity] = key
                 else:
                     kb.release(key)
-                    held_keys.discard(vk)
+                    held_keys.pop(identity, None)
             elif kind == "move":
                 dx, dy = event.get("dx"), event.get("dy")
                 if type(dx) is not int or type(dy) is not int or abs(dx) > 10000 or abs(dy) > 10000:
@@ -217,8 +243,8 @@ def serve_client(sock, secret, on_status=None):
                 ms.scroll(dx, dy)
             elif kind == "release":
                 pointer.last_move = None
-                for vk in list(held_keys):
-                    kb.release(keyboard.KeyCode.from_vk(vk))
+                for key in held_keys.values():
+                    kb.release(key)
                 for name in list(held_buttons):
                     ms.release(buttons[name])
                 held_keys.clear()
@@ -231,8 +257,8 @@ def serve_client(sock, secret, on_status=None):
     finally:
         if previous_dpi_context:
             USER32.SetThreadDpiAwarenessContext(previous_dpi_context)
-        for vk in held_keys:
-            kb.release(keyboard.KeyCode.from_vk(vk))
+        for key in held_keys.values():
+            kb.release(key)
         for name in held_buttons:
             ms.release(buttons[name])
         try:

@@ -8,7 +8,7 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 from pynput import keyboard, mouse
-from common import PORT, connect, send_batch
+from common import PORT, SHIFT_KEYS, connect, key_identity, send_batch
 from pairing import load_pairings, save_pairing
 
 CTRL = {0x11, 0xA2, 0xA3}
@@ -44,7 +44,7 @@ class ControllerPanel(ttk.Frame):
         self.sock = None
         self.remote = False
         self.stopped = False
-        self.pressed = set()
+        self.pressed = {}
         self.swallow_keyups = set()
         self.swallow_buttons = set()
         self.remote_buttons = set()
@@ -303,24 +303,38 @@ class ControllerPanel(ttk.Frame):
         if data.flags & 0x10:
             return True  # Ignore injected events.
         vk = data.vkCode
+        scan = data.scanCode
+        extended = bool(data.flags & 1)
+        key = key_identity(vk, scan, extended)
         down = msg in KEY_DOWN
         up = msg in KEY_UP
         if not (down or up):
             return True
         with self.lock:
+            # Windows temporarily synthesizes Shift transitions around keypad input.
+            # The receiver generates its own from the forwarded physical keypad key.
+            if vk in SHIFT_KEYS and scan in (0x22A, 0x236):
+                if self.remote:
+                    self.klistener.suppress_event()
+                return True
             if down:
-                self.pressed.add(vk)
+                self.pressed[key] = vk
             else:
-                self.pressed.discard(vk)
-            if up and vk in self.swallow_keyups:
-                self.swallow_keyups.discard(vk)
+                self.pressed.pop(key, None)
+            if key in self.swallow_keyups:
+                if up:
+                    self.swallow_keyups.discard(key)
                 self.klistener.suppress_event()
             if self.remote:
-                if down and vk == SPACE and self.pressed.intersection(CTRL) and self.pressed.intersection(ALT):
+                if (
+                    down and vk == SPACE
+                    and CTRL.intersection(self.pressed.values())
+                    and ALT.intersection(self.pressed.values())
+                ):
                     self._local_locked()
                     self.post_status("Connected — controller has control")
                 else:
-                    self.enqueue({"type": "key", "vk": vk, "down": down})
+                    self.enqueue({"type": "key", "vk": vk, "scan": scan, "extended": extended, "down": down})
                 self.klistener.suppress_event()
         return True
 

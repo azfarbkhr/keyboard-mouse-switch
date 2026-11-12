@@ -6,6 +6,13 @@ import ssl
 
 PORT = 45839
 MAX_LINE = 8192
+SHIFT_KEYS = {0x10, 0xA0, 0xA1}
+NUM_LOCK = 0x90
+
+
+def key_identity(vk, scan, extended):
+    # A keypad key can report a different virtual key if Num Lock changes.
+    return scan, extended, 0 if scan else vk
 
 
 def fingerprint(der):
